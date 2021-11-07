@@ -136,6 +136,8 @@ class ExtendibleHashTable {
    */
   HASH_TABLE_BUCKET_TYPE *FetchBucketPage(page_id_t bucket_page_id);
 
+  HASH_TABLE_BUCKET_TYPE *FetchPageByKey(KeyType key);
+
   /**
    * Performs insertion with an optional bucket splitting.
    *
