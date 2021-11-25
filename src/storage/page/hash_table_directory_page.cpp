@@ -31,11 +31,18 @@ uint32_t HashTableDirectoryPage::GetGlobalDepthMask() { return (1 << global_dept
 void HashTableDirectoryPage::IncrGlobalDepth() {
   for (int i = static_cast<int>(Size() - 1); i >= 0; i--) {
     bucket_page_ids_[i + Size()] = bucket_page_ids_[i];
+    local_depths_[i + Size()] = local_depths_[i];
   }
   global_depth_++;
 }
 
-void HashTableDirectoryPage::DecrGlobalDepth() { global_depth_--; }
+void HashTableDirectoryPage::DecrGlobalDepth() {
+  //    for (size_t i=Size()/2; i < Size(); i++) {
+  //        bucket_page_ids_[i] = 0;
+  //        local_depths_[i] = 0;
+  //    }
+  global_depth_--;
+}
 
 page_id_t HashTableDirectoryPage::GetBucketPageId(uint32_t bucket_idx) { return bucket_page_ids_[bucket_idx]; }
 

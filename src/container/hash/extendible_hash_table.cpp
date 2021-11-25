@@ -87,9 +87,10 @@ HASH_TABLE_BUCKET_TYPE *HASH_TABLE_TYPE::FetchPageByKey(KeyType key) {
 template <typename KeyType, typename ValueType, typename KeyComparator>
 bool HASH_TABLE_TYPE::GetValue(Transaction *transaction, const KeyType &key, std::vector<ValueType> *result) {
   table_latch_.RLock();
+  auto dpg = FetchDirectoryPage();
   auto bpg = FetchPageByKey(key);
   bool ans = bpg->GetValue(key, comparator_, result);
-  buffer_pool_manager_->UnpinPage(KeyToPageId(key, FetchDirectoryPage()), false, nullptr);
+  buffer_pool_manager_->UnpinPage(KeyToPageId(key, dpg), false, nullptr);
   buffer_pool_manager_->UnpinPage(directory_page_id_, false, nullptr);
   table_latch_.RUnlock();
   return ans;
@@ -103,55 +104,66 @@ bool HASH_TABLE_TYPE::Insert(Transaction *transaction, const KeyType &key, const
   table_latch_.WLock();
   auto bpg = FetchPageByKey(key);
   bool ans = bpg->Insert(key, value, comparator_);
-  if (!ans && bpg->IsFull()) {
-    SplitInsert(transaction, key, value);
-  }
-  buffer_pool_manager_->UnpinPage(KeyToPageId(key, FetchDirectoryPage()), true, nullptr);
+  page_id_t bpg_page_id = KeyToPageId(key, FetchDirectoryPage());  // must store this at first
   buffer_pool_manager_->UnpinPage(directory_page_id_, false, nullptr);
   table_latch_.WUnlock();
+  if (!ans) {
+    //    LOG_INFO("# Insert Failed! ");
+    std::vector<ValueType> res;
+    bpg->GetValue(key, comparator_, &res);
+    auto it = find(res.begin(), res.end(), value);
+    if (it == res.end()) {
+      ans = SplitInsert(transaction, key, value);
+    }
+  }
+  buffer_pool_manager_->UnpinPage(bpg_page_id, true, nullptr);
   return ans;
 }
 
 template <typename KeyType, typename ValueType, typename KeyComparator>
 bool HASH_TABLE_TYPE::SplitInsert(Transaction *transaction, const KeyType &key, const ValueType &value) {
-  auto bpg = FetchPageByKey(key);
   auto dpg = FetchDirectoryPage();
+  table_latch_.WLock();
+  auto bpg = FetchPageByKey(key);
   auto kti = KeyToDirectoryIndex(key, dpg);
+  auto bpg_page_id = dpg->GetBucketPageId(kti);  // must store this at first
   if (dpg->GetGlobalDepth() == dpg->GetLocalDepth(kti)) {
     if (1 << dpg->GetGlobalDepth() != DIRECTORY_ARRAY_SIZE) {
       dpg->IncrGlobalDepth();
     } else {
+      table_latch_.WUnlock();
       return false;  // DIRECTORY is full
     }
   }
   page_id_t bucket_page_id = INVALID_PAGE_ID;
-  auto bucket_page = reinterpret_cast<HashTableBucketPage<KeyType, ValueType, KeyComparator> *>(
-      buffer_pool_manager_->NewPage(&bucket_page_id, nullptr)->GetData());
-  size_t image_index = dpg->GetSplitImageIndex(kti);
-  FetchDirectoryPage()->SetBucketPageId(image_index, bucket_page_id);
+  Page *tmp = buffer_pool_manager_->NewPage(&bucket_page_id, nullptr);
+  auto bucket_page = reinterpret_cast<HashTableBucketPage<KeyType, ValueType, KeyComparator> *>(tmp->GetData());
+  // auto image_index = dpg->GetSplitImageIndex(kti);
 
   // add pointers to image page
   size_t common_bits = kti % (1 << dpg->GetLocalDepth(kti));
   size_t ld = dpg->GetLocalDepth(kti);
-  for (size_t i = common_bits; i < DIRECTORY_ARRAY_SIZE; i += (1 << ld)) {
+  for (size_t i = common_bits; i < dpg->Size(); i += (1 << ld)) {
     if (((i >> ld) & 1) != ((kti >> ld) & 1)) {
       dpg->SetBucketPageId(i, bucket_page_id);
     }
+    dpg->IncrLocalDepth(i);
   }
 
-  dpg->IncrLocalDepth(kti);
-  dpg->IncrLocalDepth(image_index);
   for (size_t i = 0; i < BUCKET_ARRAY_SIZE; i++) {
     if (bpg->IsOccupied(i)) {
-      if (KeyToDirectoryIndex(bpg->KeyAt(i), dpg) == image_index) {
+      if (static_cast<page_id_t>(KeyToPageId(bpg->KeyAt(i), dpg)) == bucket_page_id) {
         bucket_page->SetPair(bpg->KeyAt(i), bpg->ValueAt(i), i);
         bpg->DeleteAt(i);
       }
     }
   }
+  buffer_pool_manager_->UnpinPage(
+      bpg_page_id, true,
+      nullptr);  // DO NOT USE KeyToPageId(key, dpg) or dpg->GetBucketPageId(kti) as the first argument！
   buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr);
-  buffer_pool_manager_->UnpinPage(KeyToPageId(key, dpg), true, nullptr);
   buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr);
+  table_latch_.WUnlock();
   bool ans = Insert(transaction, key, value);
   return ans;
 }
@@ -163,11 +175,16 @@ template <typename KeyType, typename ValueType, typename KeyComparator>
 bool HASH_TABLE_TYPE::Remove(Transaction *transaction, const KeyType &key, const ValueType &value) {
   table_latch_.WLock();
   auto bpg = FetchPageByKey(key);
+  auto dpg = FetchDirectoryPage();
   bool ans = bpg->Remove(key, value, comparator_);
+  page_id_t bpg_page_id = KeyToPageId(key, dpg);
   if (ans && bpg->IsEmpty()) {
+    // ATTENTION! first unpin, then delete the page!
+    buffer_pool_manager_->UnpinPage(bpg_page_id, true, nullptr);
     Merge(transaction, key, value);
+  } else {
+    buffer_pool_manager_->UnpinPage(bpg_page_id, true, nullptr);
   }
-  buffer_pool_manager_->UnpinPage(KeyToPageId(key, FetchDirectoryPage()), true, nullptr);
   buffer_pool_manager_->UnpinPage(directory_page_id_, false, nullptr);
   table_latch_.WUnlock();
   return ans;
@@ -180,24 +197,43 @@ template <typename KeyType, typename ValueType, typename KeyComparator>
 void HASH_TABLE_TYPE::Merge(Transaction *transaction, const KeyType &key, const ValueType &value) {
   auto dpg = FetchDirectoryPage();
   auto kti = KeyToDirectoryIndex(key, dpg);
-  size_t image_index = dpg->GetSplitImageIndex(kti);
-  if (dpg->GetLocalDepth(kti) == 0 || dpg->GetLocalDepth(kti) != dpg->GetLocalDepth(image_index)) {
-    return;
-  }
-
-  dpg->DecrLocalDepth(image_index);
-
-  // transfer pointers to image page
-  size_t common_bits = image_index % (1 << dpg->GetLocalDepth(image_index));
-  size_t ld = dpg->GetLocalDepth(image_index);
-  for (size_t i = common_bits; i < DIRECTORY_ARRAY_SIZE; i += (1 << ld)) {
-    if (((i >> ld) & 1) == ((kti >> ld) & 1)) {
-      dpg->SetBucketPageId(i, dpg->GetBucketPageId(image_index));
-    }
-  }
-
+  MergeMain(dpg, kti);
   buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr);
-  buffer_pool_manager_->DeletePage(KeyToPageId(key, dpg), nullptr);
+}
+
+template <typename KeyType, typename ValueType, typename KeyComparator>
+bool HASH_TABLE_TYPE::MergeMain(HashTableDirectoryPage *dpg, uint32_t kti) {
+  auto bpg_page_id = dpg->GetBucketPageId(kti);
+  size_t image_index = dpg->GetSplitImageIndex(kti);
+  // ATTENTION! If image point to the common bucket, we can't merge
+  if (dpg->GetLocalDepth(kti) != 0 && dpg->GetLocalDepth(kti) == dpg->GetLocalDepth(image_index) &&
+      dpg->GetBucketPageId(kti) != dpg->GetBucketPageId(image_index)) {
+    // transfer pointers to image page
+    size_t ld = dpg->GetLocalDepth(kti) - 1;
+    size_t common_bits = image_index % (1 << ld);
+    for (size_t i = common_bits; i < dpg->Size(); i += (1 << ld)) {
+      if (((i >> ld) & 1) == ((kti >> ld) & 1)) {
+        dpg->SetBucketPageId(i, dpg->GetBucketPageId(image_index));
+      }
+      dpg->DecrLocalDepth(i);
+    }
+    buffer_pool_manager_->DeletePage(bpg_page_id, nullptr);
+    if (dpg->CanShrink()) {
+      dpg->DecrGlobalDepth();
+      for (size_t i = dpg->Size() - 1; i >= 0 && i < dpg->Size(); --i) {
+        auto bucket_page = reinterpret_cast<HASH_TABLE_BUCKET_TYPE *>(
+            buffer_pool_manager_->FetchPage(dpg->GetBucketPageId(i), nullptr)->GetData());
+        if (bucket_page->IsEmpty()) {
+          buffer_pool_manager_->UnpinPage(dpg->GetBucketPageId(i), false);
+          MergeMain(dpg, i);
+        } else {
+          buffer_pool_manager_->UnpinPage(dpg->GetBucketPageId(i), false);
+        }
+      }
+    }
+    return true;
+  }
+  return false;
 }
 
 /*****************************************************************************

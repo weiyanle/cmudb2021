@@ -35,6 +35,7 @@ template <typename KeyType, typename ValueType, typename KeyComparator>
 bool HASH_TABLE_BUCKET_TYPE::Insert(KeyType key, ValueType value, KeyComparator cmp) {
   for (size_t i = 0; i < BUCKET_ARRAY_SIZE; ++i) {
     if (IsReadable(i) && !cmp(KeyAt(i), key) && ValueAt(i) == value) {
+      // LOG_INFO("# Insert Failed. Repeated Pair!");
       return false;
     }
   }
@@ -46,6 +47,7 @@ bool HASH_TABLE_BUCKET_TYPE::Insert(KeyType key, ValueType value, KeyComparator 
       return true;
     }
   }
+  // LOG_INFO("# Insert Failed. Full! BUCKET_ARRAY_SIZE %ld and NumReadable %d", BUCKET_ARRAY_SIZE, NumReadable());
   return false;
 }
 
@@ -97,12 +99,12 @@ void HASH_TABLE_BUCKET_TYPE::SetReadable(uint32_t bucket_idx) {
 
 template <typename KeyType, typename ValueType, typename KeyComparator>
 bool HASH_TABLE_BUCKET_TYPE::IsFull() {
-  return NumReadable() == BUCKET_SIZE;
+  return NumReadable() == BUCKET_ARRAY_SIZE;
 }
 
 template <typename KeyType, typename ValueType, typename KeyComparator>
 uint32_t HASH_TABLE_BUCKET_TYPE::NumReadable() {
-  int ans = 0;
+  uint32_t ans = 0;
   for (size_t i = 0; i < BUCKET_ARRAY_SIZE; ++i) {
     if (IsReadable(i)) {
       ++ans;
@@ -147,8 +149,8 @@ void HASH_TABLE_BUCKET_TYPE::SetPair(KeyType key, ValueType value, uint32_t buck
 
 template <typename KeyType, typename ValueType, typename KeyComparator>
 void HashTableBucketPage<KeyType, ValueType, KeyComparator>::DeleteAt(uint32_t bucket_idx) {
-  occupied_[bucket_idx] = 0;
-  readable_[bucket_idx] = 0;
+  occupied_[bucket_idx / 8] &= (~(1 << bucket_idx % 8));
+  readable_[bucket_idx / 8] &= (~(1 << bucket_idx % 8));
 }
 
 // DO NOT REMOVE ANYTHING BELOW THIS LINE
