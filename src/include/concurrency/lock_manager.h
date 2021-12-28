@@ -14,13 +14,16 @@
 
 #include <algorithm>
 #include <condition_variable>  // NOLINT
+#include <fstream>
 #include <list>
 #include <memory>
 #include <mutex>  // NOLINT
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "common/config.h"
 #include "common/rid.h"
 #include "concurrency/transaction.h"
 
@@ -46,31 +49,28 @@ class LockManager {
   class LockRequestQueue {
    public:
     std::list<LockRequest> request_queue_;
-    std::condition_variable cv_;  // for notifying blocked transactions on this rid
-    bool upgrading_ = false;
+    // for notifying blocked transactions on this rid
+    std::condition_variable cv_;
+    // txn_id of an upgrading transaction (if any)
+    txn_id_t upgrading_ = INVALID_TXN_ID;
+    std::mutex latch_;
   };
 
  public:
   /**
-   * Creates a new lock manager configured for the deadlock detection policy.
+   * Creates a new lock manager configured for the deadlock prevention policy.
    */
-  LockManager() {
-    enable_cycle_detection_ = true;
-    cycle_detection_thread_ = new std::thread(&LockManager::RunCycleDetection, this);
-  }
+  LockManager() = default;
 
-  ~LockManager() {
-    enable_cycle_detection_ = false;
-    cycle_detection_thread_->join();
-    delete cycle_detection_thread_;
-  }
+  ~LockManager() = default;
 
   /*
    * [LOCK_NOTE]: For all locking functions, we:
    * 1. return false if the transaction is aborted; and
    * 2. block on wait, return true when the lock request is granted; and
-   * 3. it is undefined behavior to try locking an already locked RID in the same transaction, i.e. the transaction
-   *    is responsible for keeping track of its current locks.
+   * 3. it is undefined behavior to try locking an already locked RID in the
+   * same transaction, i.e. the transaction is responsible for keeping track of
+   * its current locks.
    */
 
   /**
@@ -92,52 +92,42 @@ class LockManager {
   /**
    * Upgrade a lock from a shared lock to an exclusive lock.
    * @param txn the transaction requesting the lock upgrade
-   * @param rid the RID that should already be locked in shared mode by the requesting transaction
+   * @param rid the RID that should already be locked in shared mode by the
+   * requesting transaction
    * @return true if the upgrade is successful, false otherwise
    */
   bool LockUpgrade(Transaction *txn, const RID &rid);
 
   /**
    * Release the lock held by the transaction.
-   * @param txn the transaction releasing the lock, it should actually hold the lock
+   * @param txn the transaction releasing the lock, it should actually hold the
+   * lock
    * @param rid the RID that is locked by the transaction
    * @return true if the unlock is successful, false otherwise
    */
   bool Unlock(Transaction *txn, const RID &rid);
 
-  /*** Graph API ***/
   /**
-   * Adds edge t1->t2
+   * @param lock_mode 0-lock shared, 1-exclusive, 2-upgrade
+   * @return true if pass the check, false or exception otherwise
    */
+  bool LockPreCheck(Transaction *txn, const RID &rid, int lock_mode);
 
-  /** Adds an edge from t1 -> t2. */
-  void AddEdge(txn_id_t t1, txn_id_t t2);
-
-  /** Removes an edge from t1 -> t2. */
-  void RemoveEdge(txn_id_t t1, txn_id_t t2);
+  std::list<LockRequest>::iterator GetRequestInQueue(LockRequestQueue *lrq, const txn_id_t &id);
 
   /**
-   * Checks if the graph has a cycle, returning the newest transaction ID in the cycle if so.
-   * @param[out] txn_id if the graph has a cycle, will contain the newest transaction ID
-   * @return false if the graph has no cycle, otherwise stores the newest transaction ID in the cycle to txn_id
+   * @param lower_bound EXCLUSIVE means only check X lock, SHARED means check S and X locks
+   * @return true if there is an older lock request, false otherwise
    */
-  bool HasCycle(txn_id_t *txn_id);
+  bool OlderExists(LockRequestQueue *lrq, const txn_id_t &id, LockMode lower_bound);
 
-  /** @return the set of all edges in the graph, used for testing only! */
-  std::vector<std::pair<txn_id_t, txn_id_t>> GetEdgeList();
-
-  /** Runs cycle detection in the background. */
-  void RunCycleDetection();
+  void KillYoungerRequests(LockRequestQueue *lrq, Transaction *txn, LockMode lower_bound);
 
  private:
   std::mutex latch_;
-  std::atomic<bool> enable_cycle_detection_;
-  std::thread *cycle_detection_thread_;
 
   /** Lock table for lock requests. */
   std::unordered_map<RID, LockRequestQueue> lock_table_;
-  /** Waits-for graph representation. */
-  std::unordered_map<txn_id_t, std::vector<txn_id_t>> waits_for_;
 };
 
 }  // namespace bustub

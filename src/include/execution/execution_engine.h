@@ -65,7 +65,7 @@ class ExecutionEngine {
         }
       }
     } catch (Exception &e) {
-      // TODO(student): handle exceptions
+      txn_mgr_->Abort(txn);
     }
 
     return true;

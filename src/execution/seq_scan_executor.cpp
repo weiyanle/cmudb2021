@@ -28,12 +28,20 @@ bool SeqScanExecutor::Next(Tuple *tuple, RID *rid) {
     ++iter_;
   }
   if (iter_ != table_info_->table_->End()) {
+    Transaction *txn = GetExecutorContext()->GetTransaction();
+    if (txn->GetIsolationLevel() != IsolationLevel::READ_UNCOMMITTED && !txn->IsSharedLocked(iter_->GetRid()) &&
+        !txn->IsExclusiveLocked(iter_->GetRid())) {
+      GetExecutorContext()->GetLockManager()->LockShared(txn, iter_->GetRid());
+    }
     std::vector<Value> values;
     for (uint32_t i = 0; i < plan_->OutputSchema()->GetColumnCount(); ++i) {
       values.emplace_back(plan_->OutputSchema()->GetColumn(i).GetExpr()->Evaluate(&*iter_, &table_info_->schema_));
     }
     *tuple = Tuple(values, plan_->OutputSchema());
     *rid = iter_->GetRid();
+    if (txn->GetIsolationLevel() == IsolationLevel::READ_COMMITTED && !txn->IsExclusiveLocked(iter_->GetRid())) {
+      GetExecutorContext()->GetLockManager()->Unlock(txn, iter_->GetRid());
+    }
     ++iter_;
     return true;
   }

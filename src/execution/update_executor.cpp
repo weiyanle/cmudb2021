@@ -31,7 +31,18 @@ bool UpdateExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
   // To avoid pushing tuple to result set, update all tuples in one Next()
   while (child_executor_->Next(&old_tuple, &old_rid)) {
     Tuple updated_tuple = GenerateUpdatedTuple(old_tuple);
+    Transaction *txn = GetExecutorContext()->GetTransaction();
+    if (!txn->IsExclusiveLocked(old_rid)) {
+      if (txn->IsSharedLocked(old_rid)) {
+        GetExecutorContext()->GetLockManager()->LockUpgrade(txn, old_rid);
+      } else {
+        GetExecutorContext()->GetLockManager()->LockExclusive(txn, old_rid);
+      }
+    }
     table_info_->table_->UpdateTuple(updated_tuple, old_rid, GetExecutorContext()->GetTransaction());
+    if (txn->GetIsolationLevel() == IsolationLevel::READ_UNCOMMITTED) {
+      GetExecutorContext()->GetLockManager()->Unlock(txn, old_rid);
+    }
     for (IndexInfo *index : indexes_) {
       std::vector<Value> old_key_index_vals{};
       for (auto const &i : index->index_->GetKeyAttrs()) {
@@ -45,6 +56,13 @@ bool UpdateExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
       }
       index->index_->InsertEntry(Tuple(updated_key_index_vals, index->index_->GetKeySchema()), old_rid,
                                  GetExecutorContext()->GetTransaction());
+      // ATTENTION! Can't pass memory test if add following codes.
+      GetExecutorContext()->GetTransaction()->GetIndexWriteSet()->emplace_back(
+          old_rid, table_info_->oid_, WType::UPDATE, Tuple(updated_key_index_vals, index->index_->GetKeySchema()),
+          index->index_oid_, GetExecutorContext()->GetCatalog());
+      GetExecutorContext()->GetTransaction()->GetIndexWriteSet()->back().old_tuple_ =
+          Tuple(old_key_index_vals, index->index_->GetKeySchema());
+
     }
   }
   return false;

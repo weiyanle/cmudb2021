@@ -42,6 +42,9 @@ bool InsertExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
           }
           index->index_->InsertEntry(Tuple(key_index_vals, index->index_->GetKeySchema()), out_rid,
                                      GetExecutorContext()->GetTransaction());
+          GetExecutorContext()->GetTransaction()->AppendTableWriteRecord(IndexWriteRecord(
+              out_rid, table_info_->oid_, WType::INSERT, Tuple(key_index_vals, index->index_->GetKeySchema()),
+              index->index_oid_, GetExecutorContext()->GetCatalog()));
         }
       }
     }
@@ -55,6 +58,9 @@ bool InsertExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
           }
           index->index_->InsertEntry(Tuple(key_index_vals, index->index_->GetKeySchema()), out_rid,
                                      GetExecutorContext()->GetTransaction());
+          GetExecutorContext()->GetTransaction()->AppendTableWriteRecord(IndexWriteRecord(
+              out_rid, table_info_->oid_, WType::INSERT, Tuple(key_index_vals, index->index_->GetKeySchema()),
+              index->index_oid_, GetExecutorContext()->GetCatalog()));
         }
       }
     }

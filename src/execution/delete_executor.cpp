@@ -31,7 +31,18 @@ bool DeleteExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
   RID old_rid;
   // To avoid pushing tuple to result set, delete all tuples in one Next()
   while (child_executor_->Next(&old_tuple, &old_rid)) {
+    Transaction *txn = GetExecutorContext()->GetTransaction();
+    if (!txn->IsExclusiveLocked(old_rid)) {
+      if (txn->IsSharedLocked(old_rid)) {
+        GetExecutorContext()->GetLockManager()->LockUpgrade(txn, old_rid);
+      } else {
+        GetExecutorContext()->GetLockManager()->LockExclusive(txn, old_rid);
+      }
+    }
     table_info_->table_->MarkDelete(old_rid, GetExecutorContext()->GetTransaction());
+    if (txn->GetIsolationLevel() == IsolationLevel::READ_UNCOMMITTED) {
+      GetExecutorContext()->GetLockManager()->Unlock(txn, old_rid);
+    }
     for (IndexInfo *index : indexes_) {
       std::vector<Value> key_index_vals{};
       for (auto const &i : index->index_->GetKeyAttrs()) {
@@ -39,6 +50,9 @@ bool DeleteExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
       }
       index->index_->DeleteEntry(Tuple(key_index_vals, index->index_->GetKeySchema()), old_rid,
                                  GetExecutorContext()->GetTransaction());
+      GetExecutorContext()->GetTransaction()->AppendTableWriteRecord(IndexWriteRecord(
+          old_rid, table_info_->oid_, WType::DELETE, Tuple(key_index_vals, index->index_->GetKeySchema()),
+          index->index_oid_, GetExecutorContext()->GetCatalog()));
     }
   }
   return false;
